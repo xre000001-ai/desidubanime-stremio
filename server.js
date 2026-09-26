@@ -14,7 +14,7 @@ import fs from 'node:fs';
 import { fetch as undiciFetch, Agent } from 'undici';
 import { poolStart, poolStats, apiFetch } from './mb-lib/pool.js';
 
-const VERSION = '2.2.1';
+const VERSION = '2.3.0';
 const BASE = 'https://www.desidubanime.me';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const CINEMETA = 'https://v3-cinemeta.strem.io';
@@ -388,15 +388,26 @@ async function abyssStreamCards(url, chosenTitle, episode, lang) {
     const seekable = src.size <= ABYSS_RANGE_MAX;
     const ok = await abyssProbe(u, seekable);
     DBG('abyssSora', src.label, ok ? 'ftyp-ok' : 'probe-fail');
+    if (!ok) return; // no phantom cards — dead tokens don't play
+    const av1 = src.codec === 'av1';
     cards.push({
-      name: `[DesiDub] Abyss ${src.label} ${lang}`,
-      title: `${chosenTitle} — E${episode}\nAbyss ${src.label} · ${src.codec || ''} · ${(src.size / 1048576).toFixed(0)}MB${seekable ? '' : ' · large file: plays from start'}\nDirect MP4 · max quality`,
+      name: `[DesiDub] Abyss ${src.label}${av1 ? ' AV1' : ''} ${lang}`,
+      title: `${chosenTitle} — E${episode}\nAbyss ${src.label} · ${src.codec || ''} · ${(src.size / 1048576).toFixed(0)}MB${seekable ? '' : ' · large file: plays from start'}\nDirect MP4 · fresh link`,
       url: u,
       behaviorHints: { notWebReady: false, proxyHeaders: { Referer: ABYSS_REFERER } },
-      _ok: ok,
-      _q: resPx(src.label),
+      _ok: true,
+      _q: resPx(src.label) - (av1 ? 1000 : 0), // h264 beats av1: playability first
+      _abyss: true,
     });
   }));
+  if (!cards.some(c => c._abyss)) {
+    cards.push({
+      name: `[DesiDub] Abyss ${lang} · App`,
+      title: `${chosenTitle} — E${episode}\nAbyss · ${lang} · opens in app player`,
+      externalUrl: `https://abysscdn.com/?v=${meta?.slug || (url.match(/([a-zA-Z0-9_-]{7,24})(?:[?#].*)?$/) || [])[1] || ''}`,
+      behaviorHints: { notWebReady: true },
+    });
+  }
   return cards;
 }
 async function abyssInfo(url) {
@@ -530,6 +541,9 @@ async function playable(u) {
 }
 
 // ─── resolve one episode ─────────────────────────────────────────────────────
+function streamTtl(streams) {
+  return streams.some(x => x._abyss) ? 3 * 60e3 : 90 * 60e3;
+}
 async function resolveEpisode(aliases, episode) {
   const { item, best, score } = await findAnime(aliases);
   if (!best) return { streams: [], note: 'not found on DesiDubAnime' };
@@ -681,7 +695,7 @@ const server = http.createServer(async (req, res) => {
               const meta = (await cinemeta(sm[1], imdb)) || (await imdbSuggest(imdb));
               if (!meta?.name) return [];
               const r = await resolveEpisode(meta.aliases, episode);
-              if (r.streams.length) cachePut(ck, r.streams, 90 * 60e3);
+              if (r.streams.length) cachePut(ck, r.streams, streamTtl(r.streams));
               return r.streams;
             })().catch(() => {}).finally(() => BG.delete(ck));
           }, 400).unref?.();
@@ -693,13 +707,13 @@ const server = http.createServer(async (req, res) => {
       const p = (async () => {
         const r = await resolveEpisode(meta.aliases, episode);
         DBG('resolved', meta.name, 'E' + episode, '->', r.streams.length, r.note || '');
-        if (r.streams.length) cachePut(ck, r.streams, 90 * 60e3);
+        if (r.streams.length) cachePut(ck, r.streams, streamTtl(r.streams));
         else cachePut(ck, r.streams, 60e3);
         // binge prewarm: next 2 episodes quietly
         if (r.streams.length && sm[1] === 'series') {
           setTimeout(() => {
             for (let e = episode + 1; e <= episode + 2; e++) {
-              resolveEpisode(meta.aliases, e).then(x => { if (x.streams.length) cachePut(`${sm[1]}:${imdb}:${season}:${e}`, x.streams, 90 * 60e3); }).catch(() => {});
+              resolveEpisode(meta.aliases, e).then(x => { if (x.streams.length) cachePut(`${sm[1]}:${imdb}:${season}:${e}`, x.streams, streamTtl(x.streams)); }).catch(() => {});
             }
           }, 1500).unref?.();
         }
