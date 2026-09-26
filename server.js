@@ -14,7 +14,7 @@ import fs from 'node:fs';
 import { fetch as undiciFetch, Agent } from 'undici';
 import { poolStart, poolStats, apiFetch } from './mb-lib/pool.js';
 
-const VERSION = '2.0.0';
+const VERSION = '2.1.0';
 const BASE = 'https://www.desidubanime.me';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const CINEMETA = 'https://v3-cinemeta.strem.io';
@@ -231,8 +231,88 @@ async function watchEmbeds(watchSlug, ep) {
   return embeds;
 }
 
+// ─── HLS re-manifest: expose video variants as explicit quality tracks ──────
+async function handleRemanifest(url, res) {
+  try {
+    const txt = await fetchText(url, { timeout: 10000, referer: BASE });
+    if (!txt || !txt.includes('#EXTM3U')) return send(res, 200, txt || '', 'application/vnd.apple.mpegurl');
+    if ((txt.match(/#EXT-X-STREAM-INF/g) || []).length <= 1) {
+      // single variant → passthrough untouched (multi-audio mapping stays intact)
+      return send(res, 200, txt, 'application/vnd.apple.mpegurl');
+    }
+    const base = new URL(url);
+    const lines = txt.split('\n');
+    const out = ['#EXTM3U'];
+    for (let i = 0; i < lines.length; i++) {
+      const L = lines[i];
+      if (L.startsWith('#EXT-X-STREAM-INF')) {
+        const attrs = L.replace(/^#EXT-X-STREAM-INF:/, '');
+        const uri = (lines[i + 1] || '').trim();
+        if (!uri) continue;
+        i++;
+        const resM = attrs.match(/RESOLUTION=(\d+)x(\d+)/);
+        const qual = resM ? `${resM[2]}p` : 'stream';
+        out.push(`#EXT-X-STREAM-INF:${attrs},NAME="${qual}"`);
+        out.push(new URL(uri, base).href);
+      } else if (i > 0) out.push(L);
+    }
+    return send(res, 200, out.join('\n') + '\n', 'application/vnd.apple.mpegurl');
+  } catch {
+    return send(res, 200, '', 'application/vnd.apple.mpegurl');
+  }
+}
+
 // ─── Abyss player ─────────────────────────────────────────────────────────────
+// Page datas blob decrypt: AES-256-CTR, key=ascii(md5hex(user_id:slug:md5_id)),
+// counter=key[0:16] → JSON {mp4:{sources[{label,size,codec,sub,path,url}],domains,fristDatas}}
 const abyssAgent = new Agent({ connect: { timeout: 9000 } });
+const { execFile } = await import('node:child_process');
+const execFileP = (file, args, timeout) => new Promise(res => {
+  execFile(file, args, { timeout, maxBuffer: 4 << 20 }, (err, stdout) => res(err ? null : stdout));
+});
+async function abyssPage(url) {
+  // undici often gets 403 (TLS fingerprint); curl passes — try both
+  try {
+    const r = await undiciFetch(url, { headers: { 'User-Agent': UA, Referer: BASE }, dispatcher: abyssAgent, signal: AbortSignal.timeout(14000) });
+    if (r.ok) {
+      const t = await r.text();
+      if (t.includes('const datas')) return t;
+    }
+  } catch { /* fall through */ }
+  return await execFileP('curl', ['-s', '-L', '--max-time', '18', '-A', UA, '-e', BASE, url], 22000);
+}
+function aesCtrHexKey(hexStr) {
+  const key = Buffer.from(hexStr, 'utf8');               // 32 ascii bytes → AES-256
+  const counter = Buffer.from(hexStr.slice(0, 16), 'utf8');
+  return data => {
+    const c = crypto.createCipheriv('aes-256-ctr', key, counter);
+    return Buffer.concat([c.update(data), c.final()]);
+  };
+}
+async function abyssMeta(url) {
+  const m = url.match(/([a-zA-Z0-9_-]{7,24})(?:[?#].*)?$/);
+  const slug = m ? m[1] : null;
+  if (!slug) return null;
+  const ck = `ab:${slug}`;
+  const e = cache.get(ck);
+  if (e && Date.now() - e.at < 3 * 3600e3) return e.v;
+  let meta = null;
+  const html = await abyssPage(url);
+  const dm = html && html.match(/const datas = "([^"]+)"/);
+  if (dm) {
+    try {
+      const blob = JSON.parse(Buffer.from(dm[1], 'base64').toString('latin1'));
+      const hex = crypto.createHash('md5').update(`${blob.user_id}:${blob.slug}:${blob.md5_id}`).digest('hex');
+      const dec = aesCtrHexKey(hex);
+      const pt = dec(Buffer.from(blob.media, 'latin1'));
+      const j = JSON.parse(pt.toString('utf8'));
+      if (j && j.mp4 && Array.isArray(j.mp4.sources)) meta = { slug, ...j };
+    } catch { /* stale */ }
+  }
+  cachePut(ck, { v: meta, at: Date.now() }, meta ? 3 * 3600e3 : 300e3);
+  DBG('abyssMeta', slug, meta ? meta.mp4.sources.map(s => s.label).join('/') : 'none');
+  return meta;
+}
 async function abyssInfo(url) {
   const m = url.match(/([a-zA-Z0-9_-]{7,24})(?:[?#].*)?$/);
   const slug = m ? m[1] : null;
@@ -383,7 +463,9 @@ async function resolveEpisode(aliases, episode) {
   for (const em of embeds) {
     const srv = em.server.toLowerCase();
     if (srv.includes('abyss')) {
-      jobs.push(abyssInfo(em.url).then(async srcs => {
+      jobs.push((async () => {
+        // 1) legacy /info attempt (some deployments expose it → direct HLS)
+        const srcs = await abyssInfo(em.url);
         if (srcs?.length) {
           const checks = await Promise.all(srcs.slice(0, 4).map(u => playable(u).then(ok => ({ u, ok }))));
           for (const { u, ok } of checks) {
@@ -395,6 +477,18 @@ async function resolveEpisode(aliases, episode) {
               _ok: ok,
             });
           }
+          return;
+        }
+        // 2) datas-blob decrypt → informed card (in-app webview player, like banglaplex)
+        const meta = await abyssMeta(em.url);
+        if (meta?.mp4?.sources?.length) {
+          const q = meta.mp4.sources.map(s => `${s.label} ${(s.size / 1048576).toFixed(0)}MB${s.codec ? ' ' + s.codec : ''}`).join(' · ');
+          streams.push({
+            name: `[DesiDub] Abyss ${em.lang} · App`,
+            title: `${chosen.title} — E${episode}\nAbyss · ${q}\nPlays in Stremio player (all qualities inside)`,
+            externalUrl: `https://abysscdn.com/?v=${meta.slug}`,
+            behaviorHints: { notWebReady: true },
+          });
         } else {
           streams.push({
             name: `[DesiDub] Abyss ${em.lang} · Browser`,
@@ -403,7 +497,7 @@ async function resolveEpisode(aliases, episode) {
             behaviorHints: { notWebReady: true },
           });
         }
-      }));
+      })());
     } else if (srv.includes('mirror') || srv.includes('filesforever')) {
       jobs.push(mirrorSources(em.url).then(async srcs => {
         if (srcs?.length) {
@@ -430,10 +524,13 @@ async function resolveEpisode(aliases, episode) {
       jobs.push(vmolySources(em.url).then(srcs => {
         if (srcs?.length) {
           for (const u of srcs.slice(0, 3)) {
+            // re-manifest through us → explicit quality switching when the
+            // source has multiple video variants; multi-audio preserved
+            const wrapped = `${PUBLIC_BASE}/hz/${Buffer.from(u).toString('base64url')}.m3u8`;
             streams.push({
               name: `[DesiDub] VMoly ${em.lang}`,
-              title: `${chosen.title} — E${episode}\nVMoly · ${em.lang} · direct`,
-              url: u,
+              title: `${chosen.title} — E${episode}\nVMoly · ${em.lang} · HLS multi-audio (hi/ta/te/en)\nAudio + quality switch in player`,
+              url: wrapped,
               behaviorHints: { notWebReady: false },
               _ok: true,
             });
@@ -500,6 +597,11 @@ const server = http.createServer(async (req, res) => {
     }
     if (u.pathname === '/') {
       return send(res, 200, `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DesiDubAnime</title></head><body style="font-family:system-ui;background:#0b0e14;color:#e8eaf0;max-width:640px;margin:40px auto;padding:0 18px"><h1 style="font-size:28px">Desi<span style="color:#ff6b35">Dub</span>Anime <span style="color:#8d96a5;font-size:14px">v${VERSION}</span></h1><p style="color:#9aa3b2;line-height:1.6">Hindi/Tamil/Telugu/Bengali dubbed anime. Multi-server with Abyss resolved (AES-CTR + /info), Mirror &amp; VMoly. Streams play direct from CDN.</p><a href="stremio://${u.host}/manifest.json" style="display:inline-block;margin-top:16px;padding:14px 34px;border-radius:12px;background:linear-gradient(90deg,#e65100,#ff6b35);color:#fff;font-weight:700;text-decoration:none">Install in Stremio</a></body></html>`, 'text/html; charset=utf-8');
+    }
+    const hz = u.pathname.match(/^\/hz\/([A-Za-z0-9_-]+?)(?:\.m3u8)?$/);
+    if (hz) {
+      try { return await handleRemanifest(Buffer.from(hz[1], 'base64url').toString('utf8'), res); }
+      catch { return send(res, 200, '', 'application/vnd.apple.mpegurl'); }
     }
     const sm = u.pathname.match(/^\/stream\/(movie|series)\/([^/]+?)(?:\/(\d+)\/(\d+))?(?:\.json)?$/);
     if (sm) {
