@@ -1,4 +1,4 @@
-# DesiDubAnime — Stremio Addon (v2.0.0)
+# DesiDubAnime — Stremio Addon (v2.1.0)
 
 Hindi / Tamil / Telugu / Bengali **dubbed anime** from [desidubanime.me](https://www.desidubanime.me) — direct streams, zero server bandwidth.
 
@@ -9,8 +9,8 @@ Hindi / Tamil / Telugu / Bengali **dubbed anime** from [desidubanime.me](https:/
 2. **Episodes** — anime page → real `watch/<slug>-episode-N/` links (cached 1 h).
 3. **Servers** — watch page `data-embed-id` (base64 server:url) → Abyss / Mirror / VMoly / Streamp2p / PlayerX.
 4. **Resolve** —
-   - **VMoly**: page regex → direct HLS (multi-audio हिन्दी/தமிழ்/తెలుగు/English) ✅ verified playable
-   - **Abyss**: `/info/{slug}` API (x-client-screen + x-referer) → AES-CTR fallback (key `md5hex(user_id:slug:md5_id)`) → browser fallback
+   - **VMoly**: page regex → direct HLS through our `/hz/` re-manifestor (quality switching when the source has multiple video variants; हिन्दी/தமிழ்/తెలుగు/English/日本語 multi-audio passthrough) ✅ verified playable
+   - **Abyss**: embed-page `datas` blob decrypted locally — AES-256-CTR, key `md5hex(user_id:slug:md5_id)` → full per-quality metadata (360p–1080p, size, codec) → in-app webview player card (`abysscdn.com/?v=<slug>`); direct `/info` attempt kept for deployments that expose it
    - **Mirror (filesforever)**: `/embedhelper2.php` POST (sid + view_token) → browser fallback
    - **Streamp2p / PlayerX**: browser fallback
 5. Every direct URL is **range-probed** before the card is served; unresolvable servers get an honest `· Browser` card (opens the embed).
