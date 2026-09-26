@@ -14,7 +14,7 @@ import fs from 'node:fs';
 import { fetch as undiciFetch, Agent } from 'undici';
 import { poolStart, poolStats, apiFetch } from './mb-lib/pool.js';
 
-const VERSION = '2.2.0';
+const VERSION = '2.2.1';
 const BASE = 'https://www.desidubanime.me';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const CINEMETA = 'https://v3-cinemeta.strem.io';
@@ -609,6 +609,13 @@ async function resolveEpisode(aliases, episode) {
     }
   }
   await Promise.all(jobs);
+  // dedupe identical urls (same file via two Abyss embeds)
+  const seenU = new Set();
+  for (let i = streams.length - 1; i >= 0; i--) {
+    const k = streams[i].url || streams[i].externalUrl;
+    if (seenU.has(k)) streams.splice(i, 1);
+    else seenU.add(k);
+  }
   // direct-play first, browser cards last; then by quality heuristics
   streams.sort((a, b) => (b._ok ? 1 : 0) - (a._ok ? 1 : 0) || (b._q || 0) - (a._q || 0));
   return { streams, note: streams.length ? null : 'no playable sources' };
