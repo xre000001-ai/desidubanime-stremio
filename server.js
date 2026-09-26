@@ -14,7 +14,7 @@ import fs from 'node:fs';
 import { fetch as undiciFetch, Agent } from 'undici';
 import { poolStart, poolStats, apiFetch } from './mb-lib/pool.js';
 
-const VERSION = '2.3.0';
+const VERSION = '2.3.1';
 const BASE = 'https://www.desidubanime.me';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const CINEMETA = 'https://v3-cinemeta.strem.io';
@@ -663,7 +663,10 @@ function send(res, status, body, ctype) {
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   try {
-    if (u.pathname === '/manifest.json') return send(res, 200, manifest);
+    if (u.pathname === '/manifest.json') {
+      const dyn = { ...manifest, logo: `${u.protocol}://${u.host}/logo.png` };
+      return send(res, 200, dyn);
+    }
     if (u.pathname === '/health') return send(res, 200, { ok: true, version: VERSION, pool: poolStats().healthy, cache: cache.size });
     if (u.pathname === '/logo.png') {
       if (!LOGO_BUF) return send(res, 404, { error: 'no logo' });
