@@ -14,7 +14,7 @@ import fs from 'node:fs';
 import { fetch as undiciFetch, Agent } from 'undici';
 import { poolStart, poolStats, apiFetch } from './mb-lib/pool.js';
 
-const VERSION = '2.1.0';
+const VERSION = '2.2.0';
 const BASE = 'https://www.desidubanime.me';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const CINEMETA = 'https://v3-cinemeta.strem.io';
@@ -306,12 +306,98 @@ async function abyssMeta(url) {
       const dec = aesCtrHexKey(hex);
       const pt = dec(Buffer.from(blob.media, 'latin1'));
       const j = JSON.parse(pt.toString('utf8'));
-      if (j && j.mp4 && Array.isArray(j.mp4.sources)) meta = { slug, ...j };
+      if (j && j.mp4 && Array.isArray(j.mp4.sources)) meta = { slug: blob.slug, md5_id: blob.md5_id, ...j };
     } catch { /* stale */ }
   }
-  cachePut(ck, { v: meta, at: Date.now() }, meta ? 3 * 3600e3 : 300e3);
+  cachePut(ck, { v: meta, at: Date.now() }, meta ? 10 * 60e3 : 300e3);
   DBG('abyssMeta', slug, meta ? meta.mp4.sources.map(s => s.label).join('/') : 'none');
   return meta;
+}
+
+// ─── Abyss /sora/ direct stream (donghua-proven protocol) ────────────────────
+// token = b64(b64(AES-256-CTR("/mp4/{md5}/{res}/{size}/{size}/0",
+//         key=utf8(md5hex(size-digits-as-bytes)), ctr=key[:16])))
+// origin decrypts server-side; Referer abyssplayer.com is required.
+const ABYSS_REFERER = 'https://abyssplayer.com/';
+const ABYSS_RANGE_MAX = 524288000;
+const CODEC_RANK = { h264: 0, avc: 0, hevc: 1, h265: 1, av1: 2 };
+function abyssToken(md5Id, resId, size, frag, index) {
+  const path = `/mp4/${md5Id}/${resId}/${size}/${frag}/${index}`;
+  const secret = Buffer.from(String(size).split('').map(ch => (ch >= '0' && ch <= '9') ? Number(ch) : ch.charCodeAt(0)));
+  const hex = crypto.createHash('md5').update(secret).digest('hex');
+  const key = Buffer.from(hex, 'utf8');
+  const c = crypto.createCipheriv('aes-256-ctr', key, key.subarray(0, 16));
+  const ct = Buffer.concat([c.update(path, 'utf8'), c.final()]);
+  const once = ct.toString('base64').replace(/=+$/, '');
+  return Buffer.from(once, 'ascii').toString('base64').replace(/=+$/, '');
+}
+const resPx = label => {
+  const m = String(label || '').match(/(\d{3,4})\s*p/);
+  return m ? Number(m[1]) : ({ '4k': 2160, '8k': 4320, origin: 9999 })[String(label || '').toLowerCase()] || 0;
+};
+async function abyssProbe(url, seekable) {
+  // sssrr origins TLS-gate undici sometimes — curl first (binary-safe head check)
+  try {
+    const cmd = `curl -s -L -m 12 -A ${JSON.stringify(UA)} -H ${JSON.stringify('Referer: ' + ABYSS_REFERER)} ${seekable ? '-H "Range: bytes=0-63" ' : ''}${JSON.stringify(url)} | head -c 64`;
+    const head = await new Promise(res => {
+      execFile('sh', ['-c', cmd], { timeout: 16000, encoding: 'buffer', maxBuffer: 1 << 16 }, (err, stdout) => res(stdout || Buffer.alloc(0)));
+    });
+    if (head.length > 8) return head[4] === 0x66 && head[5] === 0x74 && head[6] === 0x79 && head[7] === 0x70;
+  } catch { /* fall through */ }
+  try {
+    const headers = { 'User-Agent': UA, Referer: ABYSS_REFERER };
+    if (seekable) headers.Range = 'bytes=0-63';
+    const r = await undiciFetch(url, { headers, dispatcher: abyssAgent, signal: AbortSignal.timeout(12000), redirect: 'follow' });
+    let head = Buffer.alloc(0);
+    if (r.status === 200 || r.status === 206) {
+      const reader = r.body.getReader();
+      const { value } = await reader.read();
+      if (value) head = Buffer.from(value.slice(0, 64));
+      try { await reader.cancel(); } catch { /* noop */ }
+    } else { try { await r.body?.cancel(); } catch { /* noop */ } }
+    return head[4] === 0x66 && head[5] === 0x74 && head[6] === 0x79 && head[7] === 0x70;
+  } catch { return false; }
+}
+async function abyssStreamCards(url, chosenTitle, episode, lang) {
+  const cards = [];
+  const meta = await abyssMeta(url);
+  if (!meta?.mp4?.sources?.length) {
+    cards.push({
+      name: `[DesiDub] Abyss ${lang} · App`,
+      title: `${chosenTitle} — E${episode}\nAbyss · ${lang} · opens in app player`,
+      externalUrl: `https://abysscdn.com/?v=${(url.match(/([a-zA-Z0-9_-]{7,24})(?:[?#].*)?$/) || [])[1] || ''}`,
+      behaviorHints: { notWebReady: true },
+    });
+    return cards;
+  }
+  const domains = (meta.mp4.domains || []).filter(d => d && d.includes('.'));
+  if (!domains.length) return cards;
+  const root = domains[0].split('.').slice(1).join('.');
+  // best per label: h264 wins over av1, bigger size wins
+  const best = {};
+  for (const s of meta.mp4.sources || []) {
+    if (!s || !s.status || !s.label || !s.sub || !s.size || !s.res_id) continue;
+    const cand = { label: s.label, codec: (s.codec || '').toLowerCase(), size: Number(s.size), res_id: Number(s.res_id), sub: s.sub, base: `https://${s.sub}.${root}` };
+    const cur = best[s.label];
+    if (!cur || ((CODEC_RANK[cand.codec] ?? 9) - (CODEC_RANK[cur.codec] ?? 9) || cand.size - cur.size) > 0) best[s.label] = cand;
+  }
+  const list = Object.values(best).sort((a, b) => resPx(b.label) - resPx(a.label)).slice(0, 3);
+  await Promise.all(list.map(async src => {
+    const tok = abyssToken(meta.md5_id, src.res_id, src.size, src.size, 0);
+    const u = `${src.base}/sora/${src.size}/${tok}`;
+    const seekable = src.size <= ABYSS_RANGE_MAX;
+    const ok = await abyssProbe(u, seekable);
+    DBG('abyssSora', src.label, ok ? 'ftyp-ok' : 'probe-fail');
+    cards.push({
+      name: `[DesiDub] Abyss ${src.label} ${lang}`,
+      title: `${chosenTitle} — E${episode}\nAbyss ${src.label} · ${src.codec || ''} · ${(src.size / 1048576).toFixed(0)}MB${seekable ? '' : ' · large file: plays from start'}\nDirect MP4 · max quality`,
+      url: u,
+      behaviorHints: { notWebReady: false, proxyHeaders: { Referer: ABYSS_REFERER } },
+      _ok: ok,
+      _q: resPx(src.label),
+    });
+  }));
+  return cards;
 }
 async function abyssInfo(url) {
   const m = url.match(/([a-zA-Z0-9_-]{7,24})(?:[?#].*)?$/);
@@ -463,41 +549,9 @@ async function resolveEpisode(aliases, episode) {
   for (const em of embeds) {
     const srv = em.server.toLowerCase();
     if (srv.includes('abyss')) {
-      jobs.push((async () => {
-        // 1) legacy /info attempt (some deployments expose it → direct HLS)
-        const srcs = await abyssInfo(em.url);
-        if (srcs?.length) {
-          const checks = await Promise.all(srcs.slice(0, 4).map(u => playable(u).then(ok => ({ u, ok }))));
-          for (const { u, ok } of checks) {
-            streams.push({
-              name: `[DesiDub] Abyss ${em.lang}${ok ? '' : ' ·'} ${srcs.length > 1 ? '· ' + (checks.findIndex(c => c.u === u) + 1) : ''}`.replace(' ··', ' ·'),
-              title: `${chosen.title} — E${episode}\nAbyss · ${em.lang} · HLS · direct CDN`,
-              url: u,
-              behaviorHints: { notWebReady: false },
-              _ok: ok,
-            });
-          }
-          return;
-        }
-        // 2) datas-blob decrypt → informed card (in-app webview player, like banglaplex)
-        const meta = await abyssMeta(em.url);
-        if (meta?.mp4?.sources?.length) {
-          const q = meta.mp4.sources.map(s => `${s.label} ${(s.size / 1048576).toFixed(0)}MB${s.codec ? ' ' + s.codec : ''}`).join(' · ');
-          streams.push({
-            name: `[DesiDub] Abyss ${em.lang} · App`,
-            title: `${chosen.title} — E${episode}\nAbyss · ${q}\nPlays in Stremio player (all qualities inside)`,
-            externalUrl: `https://abysscdn.com/?v=${meta.slug}`,
-            behaviorHints: { notWebReady: true },
-          });
-        } else {
-          streams.push({
-            name: `[DesiDub] Abyss ${em.lang} · Browser`,
-            title: `${chosen.title} — E${episode}\nAbyss · ${em.lang} · opens in browser`,
-            externalUrl: em.url,
-            behaviorHints: { notWebReady: true },
-          });
-        }
-      })());
+      jobs.push(abyssStreamCards(em.url, chosen.title, episode, em.lang).then(cs => {
+        streams.push(...cs);
+      }));
     } else if (srv.includes('mirror') || srv.includes('filesforever')) {
       jobs.push(mirrorSources(em.url).then(async srcs => {
         if (srcs?.length) {
@@ -556,7 +610,7 @@ async function resolveEpisode(aliases, episode) {
   }
   await Promise.all(jobs);
   // direct-play first, browser cards last; then by quality heuristics
-  streams.sort((a, b) => (b._ok ? 1 : 0) - (a._ok ? 1 : 0));
+  streams.sort((a, b) => (b._ok ? 1 : 0) - (a._ok ? 1 : 0) || (b._q || 0) - (a._q || 0));
   return { streams, note: streams.length ? null : 'no playable sources' };
 }
 
