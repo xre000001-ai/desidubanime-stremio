@@ -15,7 +15,7 @@ import fs from 'node:fs';
 import { fetch as undiciFetch, Agent } from 'undici';
 import { poolStart, poolStats, apiFetch } from './mb-lib/pool.js';
 
-const VERSION = '1.2.0';
+const VERSION = '1.2.1';
 const BASE = 'https://www.desidubanime.me';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const CINEMETA = 'https://v3-cinemeta.strem.io';
@@ -927,7 +927,8 @@ const server = http.createServer(async (req, res) => {
   try {
     if (u.pathname === '/manifest.json') {
       const proto = String(req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
-      const host = String(req.headers['x-forwarded-host'] || req.headers.host || new URL(PUBLIC_BASE).host).split(',')[0].trim();
+      let host = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
+      if (!host.includes('.')) host = new URL(PUBLIC_BASE).host; // beamup proxy strips domain -> trust PUBLIC_BASE
       return send(res, 200, { ...manifest, logo: `${proto}://${host}/logo.png` });
     }
     if (u.pathname === '/health') return send(res, 200, { ok: true, version: VERSION, pool: poolStats().healthy, cache: cache.size });
