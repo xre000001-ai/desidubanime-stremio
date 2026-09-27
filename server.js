@@ -15,7 +15,7 @@ import fs from 'node:fs';
 import { fetch as undiciFetch, Agent } from 'undici';
 import { poolStart, poolStats, apiFetch } from './mb-lib/pool.js';
 
-const VERSION = '2.7.0';
+const VERSION = '2.7.1';
 const BASE = 'https://www.desidubanime.me';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const CINEMETA = 'https://v3-cinemeta.strem.io';
@@ -555,7 +555,7 @@ async function abyssStreamCards(url, chosenTitle, episode, lang) {
     // gives chunk-mapped seeking on any file size.
     cards.push({
       name: `[DesiDub] Abyss ${src.label}${av1 ? ' AV1' : ''} ${lang}`,
-      title: `${chosenTitle} — E${episode}\nAbyss ${src.label} · ${src.codec || ''} · ${(src.size / 1048576).toFixed(0)}MB · full seek, any app`,
+      title: `${chosenTitle} — E${episode}\nAbyss ${src.label} · ${src.codec || ''} · ${(src.size / 1048576).toFixed(0)}MB\nSmall jumps: instant · Big jumps: few-sec buffering`,
       url: `${PUBLIC_BASE}/ar/${meta.md5_id}/${src.res_id}/${src.size}/${src.base.replace('https://', '')}?v=${Date.now().toString(36)}`,
       behaviorHints: { notWebReady: false },
       _ok: true,
@@ -758,7 +758,7 @@ async function resolveEpisode(aliases, episode) {
             // RELAY (user's apps/networks fail on direct vmoly; through us it plays)
             streams.push({
               name: `[DesiDub] VMoly ${em.lang}`,
-              title: `${chosen.title} — E${episode}\nVMoly · ${em.lang} · HLS multi-audio (hi/ta/te/en)`,
+              title: `${chosen.title} — E${episode}\nVMoly · ${em.lang} · HLS multi-audio · BEST seeking`,
               url: `${PUBLIC_BASE}/vm/${vmB64(u)}.m3u8`,
               behaviorHints: { notWebReady: false },
               _ok: true,
