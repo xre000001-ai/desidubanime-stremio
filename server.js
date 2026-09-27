@@ -15,7 +15,7 @@ import fs from 'node:fs';
 import { fetch as undiciFetch, Agent } from 'undici';
 import { poolStart, poolStats, apiFetch } from './mb-lib/pool.js';
 
-const VERSION = '2.4.2';
+const VERSION = '2.5.0';
 const BASE = 'https://www.desidubanime.me';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const CINEMETA = 'https://v3-cinemeta.strem.io';
@@ -191,7 +191,7 @@ async function findAnime(aliases) {
 async function animeEpisodes(slug) {
   const ck = `eps:${slug}`;
   const e = cache.get(ck);
-  if (e && Date.now() - e.at < (e.v.watch.size ? 3600e3 : 3 * 60e3)) return e.v;
+  if (e && e.v && Date.now() - e.at < (e.v.watch?.size ? 3600e3 : 3 * 60e3)) return e.v;
   const html = await fetchText(`${BASE}/anime/${slug}/`, { timeout: 13000 });
   const v = { watch: new Map(), total: 0 };   // ep -> watch url
   if (html) {
@@ -316,60 +316,60 @@ async function abyssMeta(url) {
 }
 
 
-// ─── Abyss /ar/ byte-proxy: fresh token at click-time, server-side Referer ───
-async function handleAbyssProxy(req, res, m) {
-  const [, md5, resId, size, host] = m;
-  const tok = abyssToken(md5, resId, size, size, 0);
-  const up = `https://${host}/sora/${size}/${tok}`;
-  const range = req.headers.range;
-  const args = ['-s', '-N', '-L', '-i', '-A', UA, '-H', `Referer: ${ABYSS_REFERER}`];
-  if (range) args.push('-H', `Range: ${range}`);
-  args.push(up);
-  res.on('close', () => { try { child.kill('SIGKILL'); } catch { /* noop */ } });
-  let child;
-  try { child = spawn('curl', args); } catch { return send(res, 502, ''); }
-  let buf = Buffer.alloc(0);
-  let headerDone = false;
-  child.stdout.on('data', d => {
-    if (headerDone) { res.write(d); return; }
-    buf = Buffer.concat([buf, d]);
-    // strip redirect hop headers; use the final header block
-    while (!headerDone) {
-      const i = buf.indexOf('\r\n\r\n');
-      if (i < 0) return;
-      const block = buf.slice(0, i).toString('latin1');
-      const st = parseInt((block.match(/HTTP\/\S+ (\d{3})/) || [])[1] || 0, 10);
-      buf = buf.slice(i + 4);
-      if (st >= 300 && st < 400) continue; // another hop follows
-      const hh = {};
-      for (const L of block.split('\r\n').slice(1)) {
-        const c = L.indexOf(':');
-        if (c > 0) hh[L.slice(0, c).trim().toLowerCase()] = L.slice(c + 1).trim();
-      }
-      headerDone = true;
-      res.writeHead(st, {
-        'content-type': 'video/mp4',
-        ...(hh['content-length'] ? { 'content-length': hh['content-length'] } : {}),
-        ...(hh['content-range'] ? { 'content-range': hh['content-range'] } : {}),
-        'accept-ranges': hh['accept-ranges'] || 'bytes',
-        'access-control-allow-origin': '*',
-        'access-control-expose-headers': 'content-range, content-length, accept-ranges',
-        'cache-control': 'no-store',
-      });
-      if (buf.length) res.write(buf);
+
+// ─── VMoly /vm/ relay: server-bound signature for every byte, UA injected ────
+const VM_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+const vmB64 = u => Buffer.from(u).toString('base64url');
+function vmRewrite(txt, baseUrl) {
+  return txt.split('\n').map(L => {
+    const line = L.trim();
+    if (!line) return L;
+    if (line.startsWith('#')) return L.replace(/URI="([^"]+)"/g, (m, u0) => {
+      try { return `URI="/vm/${vmB64(new URL(u0, baseUrl).href)}.m3u8"`; } catch { return m; }
+    });
+    try {
+      const abs = new URL(line, baseUrl).href;
+      return `/vm/${vmB64(abs)}${abs.includes('.m3u8') ? '.m3u8' : '.ts'}`;
+    } catch { return L; }
+  }).join('\n');
+}
+async function handleVmProxy(res, target, asM3u8) {
+  const isM3u8 = asM3u8 || target.includes('.m3u8');
+  try {
+    const r = await undiciFetch(target, { headers: { 'User-Agent': VM_UA }, signal: AbortSignal.timeout(15000) });
+    if (isM3u8) {
+      const txt = await r.text();
+      if (r.status !== 200 || !txt.includes('#EXTM3U')) { res.writeHead(502, { 'access-control-allow-origin': '*' }); return res.end(''); }
+      res.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl', 'cache-control': 'no-store', 'access-control-allow-origin': '*' });
+      return res.end(vmRewrite(txt, target));
     }
-  });
-  child.stdout.on('end', () => { if (!headerDone) { try { res.writeHead(502); } catch { /* noop */ } } res.end(); });
-  child.on('error', () => { if (!res.headersSent) { try { res.writeHead(502); } catch { /* noop */ } } res.end(); });
+    res.writeHead(r.status, {
+      'content-type': 'video/mp2t',
+      ...(r.headers.get('content-length') ? { 'content-length': r.headers.get('content-length') } : {}),
+      'cache-control': 'no-store',
+      'access-control-allow-origin': '*',
+    });
+    const reader = r.body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      res.write(Buffer.from(value));
+    }
+    res.end();
+  } catch {
+    if (!res.headersSent) res.writeHead(502, { 'access-control-allow-origin': '*' });
+    res.end();
+  }
 }
 
-// ─── Abyss /sora/ direct stream (donghua-proven protocol) ────────────────────
-// token = b64(b64(AES-256-CTR("/mp4/{md5}/{res}/{size}/{size}/0",
-//         key=utf8(md5hex(size-digits-as-bytes)), ctr=key[:16])))
-// origin decrypts server-side; Referer abyssplayer.com is required.
+// ─── Abyss crypto (donghua-proven) ───────────────────────────────────────────
 const ABYSS_REFERER = 'https://abyssplayer.com/';
 const ABYSS_RANGE_MAX = 524288000;
 const CODEC_RANK = { h264: 0, avc: 0, hevc: 1, h265: 1, av1: 2 };
+const resPx = label => {
+  const mm = String(label || '').match(/(\d{3,4})\s*p/);
+  return mm ? Number(mm[1]) : ({ '4k': 2160, '8k': 4320, origin: 9999 })[String(label || '').toLowerCase()] || 0;
+};
 function abyssToken(md5Id, resId, size, frag, index) {
   const path = `/mp4/${md5Id}/${resId}/${size}/${frag}/${index}`;
   const secret = Buffer.from(String(size).split('').map(ch => (ch >= '0' && ch <= '9') ? Number(ch) : ch.charCodeAt(0)));
@@ -380,10 +380,85 @@ function abyssToken(md5Id, resId, size, frag, index) {
   const once = ct.toString('base64').replace(/=+$/, '');
   return Buffer.from(once, 'ascii').toString('base64').replace(/=+$/, '');
 }
-const resPx = label => {
-  const m = String(label || '').match(/(\d{3,4})\s*p/);
-  return m ? Number(m[1]) : ({ '4k': 2160, '8k': 4320, origin: 9999 })[String(label || '').toLowerCase()] || 0;
-};
+// ─── Abyss /ar/ byte-proxy: fresh token at click-time, server-side Referer ───
+async function handleAbyssProxy(req, res, m) {
+  const [, md5, resId, sizeS, host] = m;
+  const size = Number(sizeS);
+  const CHUNK = 4194304; // origin accepts arbitrary frag sizes: fragment i = bytes [i*CHUNK, (i+1)*CHUNK)
+  const range = req.headers.range;
+  let A = 0, B;
+  if (range) {
+    const rm = String(range).match(/bytes=(\d+)-(\d*)/);
+    if (rm) { A = Number(rm[1]); if (rm[2]) B = Number(rm[2]); }
+  }
+  if (A >= size) { res.writeHead(416, { 'content-range': `bytes */${size}`, 'access-control-allow-origin': '*' }); return res.end(); }
+  if (req.method === 'HEAD') {
+    res.writeHead(200, {
+      'content-type': 'video/mp4',
+      'content-length': size,
+      'accept-ranges': 'bytes',
+      'access-control-allow-origin': '*',
+      'access-control-expose-headers': 'content-range, content-length, accept-ranges',
+    });
+    return res.end();
+  }
+  const idx = Math.floor(A / CHUNK);
+  const off = A - idx * CHUNK;
+  const end = Math.min(B ?? Infinity, idx * CHUNK + CHUNK - 1, size - 1);
+  const len = end - A + 1;
+  const tok = abyssToken(md5, resId, size, CHUNK, idx);
+  const up = `https://${host}/sora/${size}/${tok}`;
+  res.on('close', () => { try { child.kill('SIGKILL'); } catch { /* noop */ } });
+  let child;
+  const args = ['-s', '-N', '-i', '-L', '-A', UA, '-H', `Referer: ${ABYSS_REFERER}`, up];
+  try { child = spawn('curl', args); } catch { return send(res, 502, ''); }
+  let skip = off, left = len, headerDone = false, buf = Buffer.alloc(0);
+  child.stdout.on('data', d => {
+    if (!headerDone) {
+      buf = Buffer.concat([buf, d]);
+      // walk through redirect hop headers; final block decides the status
+      for (;;) {
+        const i = buf.indexOf('\r\n\r\n');
+        if (i < 0) return;
+        const block = buf.slice(0, i).toString('latin1');
+        const st = parseInt((block.match(/HTTP\/\S+ (\d{3})/) || [])[1] || 0, 10);
+        buf = buf.slice(i + 4);
+        if (st >= 300 && st < 400) continue; // another hop follows
+        headerDone = true;
+        if (st !== 200 && st !== 206) {
+          if (!res.headersSent) res.writeHead(502, { 'access-control-allow-origin': '*' });
+          try { child.kill('SIGKILL'); } catch { /* noop */ }
+          return res.end();
+        }
+        res.writeHead(206, {
+          'content-type': 'video/mp4',
+          'content-length': len,
+          'content-range': `bytes ${A}-${end}/${size}`,
+          'accept-ranges': 'bytes',
+          'cache-control': 'no-store',
+          'access-control-allow-origin': '*',
+          'access-control-expose-headers': 'content-range, content-length, accept-ranges',
+        });
+        break;
+      }
+      if (!headerDone) return;
+      d = buf; // remainder after the final header block
+    }
+    if (skip > 0) {
+      if (d.length <= skip) { skip -= d.length; return; }
+      d = d.slice(skip); skip = 0;
+    }
+    if (left <= 0) return;
+    if (d.length > left) d = d.slice(0, left);
+    res.write(d); left -= d.length;
+    if (left <= 0) { try { child.kill('SIGKILL'); } catch { /* noop */ } res.end(); }
+  });
+  child.stdout.on('end', () => {
+    if (!headerDone) { if (!res.headersSent) res.writeHead(502, { 'access-control-allow-origin': '*' }); return res.end(); }
+    if (left > 0 && !res.writableEnded) res.end();
+  });
+  child.on('error', () => { if (!res.headersSent) { try { res.writeHead(502); } catch { /* noop */ } } res.end(); });
+}
 async function abyssProbe(url, seekable) {
   // sssrr origins TLS-gate undici sometimes — curl first (binary-safe head check)
   try {
@@ -442,7 +517,7 @@ async function abyssStreamCards(url, chosenTitle, episode, lang) {
     cards.push({
       name: `[DesiDub] Abyss ${src.label}${av1 ? ' AV1' : ''} ${lang}`,
       title: `${chosenTitle} — E${episode}\nAbyss ${src.label} · ${src.codec || ''} · ${(src.size / 1048576).toFixed(0)}MB\nDirect play on every app`,
-      url: `${PUBLIC_BASE}/ar/${meta.md5_id}/${src.res_id}/${src.size}/${src.base.replace('https://', '')}`,
+      url: `${PUBLIC_BASE}/ar/${meta.md5_id}/${src.res_id}/${src.size}/${src.base.replace('https://', '')}?v=${Date.now().toString(36)}`,
       behaviorHints: { notWebReady: false },
       _ok: true,
       _q: resPx(src.label) - (av1 ? 1000 : 0), // h264 beats av1: playability first
@@ -641,12 +716,12 @@ async function resolveEpisode(aliases, episode) {
       jobs.push(vmolySources(em.url).then(srcs => {
         if (srcs?.length) {
           for (const u of srcs.slice(0, 3)) {
-            // direct upstream URL — vmoly signatures bind to the FETCHER's IP,
-            // so the client must fetch the playlist itself (wrapping breaks it)
+            // full relay: master+playlists+segments all via /vm/ — the vmoly
+            // signature stays bound to OUR server for every byte (client-agnostic)
             streams.push({
               name: `[DesiDub] VMoly ${em.lang}`,
               title: `${chosen.title} — E${episode}\nVMoly · ${em.lang} · HLS multi-audio (hi/ta/te/en)`,
-              url: u,
+              url: `${PUBLIC_BASE}/vm/${vmB64(u)}.m3u8`,
               behaviorHints: { notWebReady: false },
               _ok: true,
             });
@@ -724,6 +799,8 @@ const server = http.createServer(async (req, res) => {
     if (u.pathname === '/') {
       return send(res, 200, `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DesiDubAnime</title></head><body style="font-family:system-ui;background:#0b0e14;color:#e8eaf0;max-width:640px;margin:40px auto;padding:0 18px"><h1 style="font-size:28px">Desi<span style="color:#ff6b35">Dub</span>Anime <span style="color:#8d96a5;font-size:14px">v${VERSION}</span></h1><p style="color:#9aa3b2;line-height:1.6">Hindi/Tamil/Telugu/Bengali dubbed anime. Multi-server with Abyss resolved (AES-CTR + /info), Mirror &amp; VMoly. Streams play direct from CDN.</p><a href="stremio://${u.host}/manifest.json" style="display:inline-block;margin-top:16px;padding:14px 34px;border-radius:12px;background:linear-gradient(90deg,#e65100,#ff6b35);color:#fff;font-weight:700;text-decoration:none">Install in Stremio</a></body></html>`, 'text/html; charset=utf-8');
     }
+    const vm = u.pathname.match(/^\/vm\/([A-Za-z0-9_-]+?)(?:\.(?:m3u8|ts))?$/);
+    if (vm) return handleVmProxy(res, Buffer.from(vm[1], 'base64url').toString('utf8'), u.pathname.endsWith('.m3u8'));
     const ar = u.pathname.match(/^\/ar\/(\d+)\/(\d+)\/(\d+)\/([a-z0-9.-]+\.[a-z]{2,})$/i);
     if (ar) {
       if (req.method === 'OPTIONS') {
