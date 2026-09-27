@@ -15,7 +15,7 @@ import fs from 'node:fs';
 import { fetch as undiciFetch, Agent } from 'undici';
 import { poolStart, poolStats, apiFetch } from './mb-lib/pool.js';
 
-const VERSION = '2.6.0';
+const VERSION = '2.7.0';
 const BASE = 'https://www.desidubanime.me';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const CINEMETA = 'https://v3-cinemeta.strem.io';
@@ -550,31 +550,19 @@ async function abyssStreamCards(url, chosenTitle, episode, lang) {
     DBG('abyssSora', src.label, ok ? 'ftyp-ok' : 'probe-fail');
     if (!ok) return; // no phantom cards — dead tokens don't play
     const av1 = src.codec === 'av1';
-    // DIRECT: origin speed, zero server bandwidth (app must send Referer via proxyHeaders)
+    // RELAY for every quality — direct sora needs Referer headers most apps
+    // never send (proven twice); /ar/ mints a fresh token per request and
+    // gives chunk-mapped seeking on any file size.
     cards.push({
       name: `[DesiDub] Abyss ${src.label}${av1 ? ' AV1' : ''} ${lang}`,
-      title: `${chosenTitle} — E${episode}\nAbyss ${src.label} · ${src.codec || ''} · ${(src.size / 1048576).toFixed(0)}MB · CDN-direct (fast, full seek)`,
-      url: u,
-      behaviorHints: { notWebReady: false, proxyHeaders: { Referer: ABYSS_REFERER } },
+      title: `${chosenTitle} — E${episode}\nAbyss ${src.label} · ${src.codec || ''} · ${(src.size / 1048576).toFixed(0)}MB · full seek, any app`,
+      url: `${PUBLIC_BASE}/ar/${meta.md5_id}/${src.res_id}/${src.size}/${src.base.replace('https://', '')}?v=${Date.now().toString(36)}`,
+      behaviorHints: { notWebReady: false },
       _ok: true,
       _q: resPx(src.label) - (av1 ? 1000 : 0),
       _abyss: true,
     });
   }));
-  // RELAY fallback: exactly one, for the best non-AV1 quality (slow, plays anywhere)
-  const best264 = list.find(x => (x.codec || '') !== 'av1');
-  if (best264) {
-    cards.push({
-      name: `[DesiDub] Abyss ${best264.label} ${lang} ·Relay`,
-      title: `${chosenTitle} — E${episode}\nAbyss ${best264.label} · server-relayed (slower, plays everywhere)`,
-      url: `${PUBLIC_BASE}/ar/${meta.md5_id}/${best264.res_id}/${best264.size}/${best264.base.replace('https://', '')}?v=${Date.now().toString(36)}`,
-      behaviorHints: { notWebReady: false },
-      _ok: true,
-      _q: resPx(best264.label) - 500,
-      _relay: true,
-      _abyss: true,
-    });
-  }
   if (!cards.some(c => c._abyss)) {
     cards.push({
       name: `[DesiDub] Abyss ${lang} · App`,
@@ -767,23 +755,13 @@ async function resolveEpisode(aliases, episode) {
       jobs.push(vmolySources(em.url).then(srcs => {
         if (srcs?.length) {
           for (const u of srcs.slice(0, 3)) {
-            // DIRECT: signatures are not IP-bound (proven in v2.0.0) — client
-            // hits vmoly straight: full speed, zero relay bandwidth
+            // RELAY (user's apps/networks fail on direct vmoly; through us it plays)
             streams.push({
               name: `[DesiDub] VMoly ${em.lang}`,
-              title: `${chosen.title} — E${episode}\nVMoly · ${em.lang} · HLS multi-audio (hi/ta/te/en) · CDN-direct (fast)`,
-              url: u,
-              behaviorHints: { notWebReady: false },
-              _ok: true,
-            });
-            // RELAY fallback (through us; slower but bypasses client-side issues)
-            streams.push({
-              name: `[DesiDub] VMoly ${em.lang} ·Relay`,
-              title: `${chosen.title} — E${episode}\nVMoly · ${em.lang} · server-relayed (slower)`,
+              title: `${chosen.title} — E${episode}\nVMoly · ${em.lang} · HLS multi-audio (hi/ta/te/en)`,
               url: `${PUBLIC_BASE}/vm/${vmB64(u)}.m3u8`,
               behaviorHints: { notWebReady: false },
               _ok: true,
-              _q: -1,
             });
           }
         } else {
