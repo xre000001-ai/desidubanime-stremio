@@ -15,12 +15,12 @@ import fs from 'node:fs';
 import { fetch as undiciFetch, Agent } from 'undici';
 import { poolStart, poolStats, apiFetch } from './mb-lib/pool.js';
 
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 const BASE = 'https://www.desidubanime.me';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const CINEMETA = 'https://v3-cinemeta.strem.io';
 const IMDB_SUGGEST = 'https://v2.sg.media-imdb.com/suggestion';
-const PUBLIC_BASE = process.env.PUBLIC_BASE || 'https://5a16d5684c14-desidubanime-stremio.baby-beamup.club';
+const PUBLIC_BASE = process.env.PUBLIC_BASE || 'https://5a16d5684c14-anihub-stremio.baby-beamup.club';
 const PORT = parseInt(process.env.PORT, 10) || 7000;
 const DEBUG = !!process.env.NMDEBUG;
 const WALL_MS = 11500;
@@ -103,6 +103,9 @@ async function imdbSuggest(id) {
 
 // ─── DesiDubAnime search (site search HTML) ─────────────────────────────────
 const nz = s => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+// last-known-good search rows per query (survives WAF throttles; the site's
+// catalog is stable, so a 48h-old mapping is still far better than zero)
+const slugMemo = new Map();   // query(lower) -> { r, at }
 async function searchAnime(query) {
   const ck = `s:${query.toLowerCase()}`;
   const e = cache.get(ck);
@@ -147,6 +150,17 @@ async function searchAnime(query) {
   const good = results.length > 0;
   cachePut(ck, { r: results, good, at: Date.now() }, good ? 6 * 3600e3 : 120e3);
   DBG('search', query, '->', results.length);
+  if (results.length) {
+    if (slugMemo.size >= 300) slugMemo.delete(slugMemo.keys().next().value);
+    slugMemo.set(query.toLowerCase(), { r: results, at: Date.now() });
+  } else {
+    // throttled/empty: serve last-known-good rows (up to 48h old) instead of nothing
+    const memo = slugMemo.get(query.toLowerCase());
+    if (memo && Date.now() - memo.at < 48 * 3600e3) {
+      DBG('search-stale', query, '->', memo.r.length, Math.round((Date.now() - memo.at) / 60000) + 'min-old');
+      return memo.r;
+    }
+  }
   return results;
 }
 const ROMANS = ['', 'I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X', 'XI', 'XII'];
@@ -912,8 +926,9 @@ const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   try {
     if (u.pathname === '/manifest.json') {
-      const dyn = { ...manifest, logo: `${u.protocol}://${u.host}/logo.png` };
-      return send(res, 200, dyn);
+      const proto = String(req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
+      const host = String(req.headers['x-forwarded-host'] || req.headers.host || new URL(PUBLIC_BASE).host).split(',')[0].trim();
+      return send(res, 200, { ...manifest, logo: `${proto}://${host}/logo.png` });
     }
     if (u.pathname === '/health') return send(res, 200, { ok: true, version: VERSION, pool: poolStats().healthy, cache: cache.size });
     if (u.pathname === '/logo.png') {
