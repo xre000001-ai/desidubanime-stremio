@@ -15,7 +15,7 @@ import fs from 'node:fs';
 import { fetch as undiciFetch, Agent } from 'undici';
 import { poolStart, poolStats, apiFetch } from './mb-lib/pool.js';
 
-const VERSION = '2.4.0';
+const VERSION = '2.4.1';
 const BASE = 'https://www.desidubanime.me';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const CINEMETA = 'https://v3-cinemeta.strem.io';
@@ -352,6 +352,9 @@ async function handleAbyssProxy(req, res, m) {
         ...(hh['content-length'] ? { 'content-length': hh['content-length'] } : {}),
         ...(hh['content-range'] ? { 'content-range': hh['content-range'] } : {}),
         'accept-ranges': hh['accept-ranges'] || 'bytes',
+        'access-control-allow-origin': '*',
+        'access-control-expose-headers': 'content-range, content-length, accept-ranges',
+        'cache-control': 'no-store',
       });
       if (buf.length) res.write(buf);
     }
@@ -722,7 +725,18 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DesiDubAnime</title></head><body style="font-family:system-ui;background:#0b0e14;color:#e8eaf0;max-width:640px;margin:40px auto;padding:0 18px"><h1 style="font-size:28px">Desi<span style="color:#ff6b35">Dub</span>Anime <span style="color:#8d96a5;font-size:14px">v${VERSION}</span></h1><p style="color:#9aa3b2;line-height:1.6">Hindi/Tamil/Telugu/Bengali dubbed anime. Multi-server with Abyss resolved (AES-CTR + /info), Mirror &amp; VMoly. Streams play direct from CDN.</p><a href="stremio://${u.host}/manifest.json" style="display:inline-block;margin-top:16px;padding:14px 34px;border-radius:12px;background:linear-gradient(90deg,#e65100,#ff6b35);color:#fff;font-weight:700;text-decoration:none">Install in Stremio</a></body></html>`, 'text/html; charset=utf-8');
     }
     const ar = u.pathname.match(/^\/ar\/(\d+)\/(\d+)\/(\d+)\/([a-z0-9.-]+\.[a-z]{2,})$/i);
-    if (ar) return handleAbyssProxy(req, res, ar);
+    if (ar) {
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204, {
+          'access-control-allow-origin': '*',
+          'access-control-allow-methods': 'GET, HEAD, OPTIONS',
+          'access-control-allow-headers': 'range, referer, origin',
+          'access-control-max-age': '86400',
+        });
+        return res.end();
+      }
+      return handleAbyssProxy(req, res, ar);
+    }
     const hz = u.pathname.match(/^\/hz\/([A-Za-z0-9_-]+?)(?:\.m3u8)?$/);
     if (hz) {
       try { return await handleRemanifest(Buffer.from(hz[1], 'base64url').toString('utf8'), res); }
