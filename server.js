@@ -10,11 +10,12 @@
 
 import http from 'node:http';
 import crypto from 'node:crypto';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import { fetch as undiciFetch, Agent } from 'undici';
 import { poolStart, poolStats, apiFetch } from './mb-lib/pool.js';
 
-const VERSION = '2.3.1';
+const VERSION = '2.4.0';
 const BASE = 'https://www.desidubanime.me';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const CINEMETA = 'https://v3-cinemeta.strem.io';
@@ -314,6 +315,51 @@ async function abyssMeta(url) {
   return meta;
 }
 
+
+// ─── Abyss /ar/ byte-proxy: fresh token at click-time, server-side Referer ───
+async function handleAbyssProxy(req, res, m) {
+  const [, md5, resId, size, host] = m;
+  const tok = abyssToken(md5, resId, size, size, 0);
+  const up = `https://${host}/sora/${size}/${tok}`;
+  const range = req.headers.range;
+  const args = ['-s', '-N', '-L', '-i', '-A', UA, '-H', `Referer: ${ABYSS_REFERER}`];
+  if (range) args.push('-H', `Range: ${range}`);
+  args.push(up);
+  res.on('close', () => { try { child.kill('SIGKILL'); } catch { /* noop */ } });
+  let child;
+  try { child = spawn('curl', args); } catch { return send(res, 502, ''); }
+  let buf = Buffer.alloc(0);
+  let headerDone = false;
+  child.stdout.on('data', d => {
+    if (headerDone) { res.write(d); return; }
+    buf = Buffer.concat([buf, d]);
+    // strip redirect hop headers; use the final header block
+    while (!headerDone) {
+      const i = buf.indexOf('\r\n\r\n');
+      if (i < 0) return;
+      const block = buf.slice(0, i).toString('latin1');
+      const st = parseInt((block.match(/HTTP\/\S+ (\d{3})/) || [])[1] || 0, 10);
+      buf = buf.slice(i + 4);
+      if (st >= 300 && st < 400) continue; // another hop follows
+      const hh = {};
+      for (const L of block.split('\r\n').slice(1)) {
+        const c = L.indexOf(':');
+        if (c > 0) hh[L.slice(0, c).trim().toLowerCase()] = L.slice(c + 1).trim();
+      }
+      headerDone = true;
+      res.writeHead(st, {
+        'content-type': hh['content-type'] || 'video/mp4',
+        ...(hh['content-length'] ? { 'content-length': hh['content-length'] } : {}),
+        ...(hh['content-range'] ? { 'content-range': hh['content-range'] } : {}),
+        'accept-ranges': hh['accept-ranges'] || 'bytes',
+      });
+      if (buf.length) res.write(buf);
+    }
+  });
+  child.stdout.on('end', () => { if (!headerDone) { try { res.writeHead(502); } catch { /* noop */ } } res.end(); });
+  child.on('error', () => { if (!res.headersSent) { try { res.writeHead(502); } catch { /* noop */ } } res.end(); });
+}
+
 // ─── Abyss /sora/ direct stream (donghua-proven protocol) ────────────────────
 // token = b64(b64(AES-256-CTR("/mp4/{md5}/{res}/{size}/{size}/0",
 //         key=utf8(md5hex(size-digits-as-bytes)), ctr=key[:16])))
@@ -392,9 +438,9 @@ async function abyssStreamCards(url, chosenTitle, episode, lang) {
     const av1 = src.codec === 'av1';
     cards.push({
       name: `[DesiDub] Abyss ${src.label}${av1 ? ' AV1' : ''} ${lang}`,
-      title: `${chosenTitle} — E${episode}\nAbyss ${src.label} · ${src.codec || ''} · ${(src.size / 1048576).toFixed(0)}MB${seekable ? '' : ' · large file: plays from start'}\nDirect MP4 · fresh link`,
-      url: u,
-      behaviorHints: { notWebReady: false, proxyHeaders: { Referer: ABYSS_REFERER } },
+      title: `${chosenTitle} — E${episode}\nAbyss ${src.label} · ${src.codec || ''} · ${(src.size / 1048576).toFixed(0)}MB\nDirect play on every app`,
+      url: `${PUBLIC_BASE}/ar/${meta.md5_id}/${src.res_id}/${src.size}/${src.base.replace('https://', '')}`,
+      behaviorHints: { notWebReady: false },
       _ok: true,
       _q: resPx(src.label) - (av1 ? 1000 : 0), // h264 beats av1: playability first
       _abyss: true,
@@ -592,13 +638,12 @@ async function resolveEpisode(aliases, episode) {
       jobs.push(vmolySources(em.url).then(srcs => {
         if (srcs?.length) {
           for (const u of srcs.slice(0, 3)) {
-            // re-manifest through us → explicit quality switching when the
-            // source has multiple video variants; multi-audio preserved
-            const wrapped = `${PUBLIC_BASE}/hz/${Buffer.from(u).toString('base64url')}.m3u8`;
+            // direct upstream URL — vmoly signatures bind to the FETCHER's IP,
+            // so the client must fetch the playlist itself (wrapping breaks it)
             streams.push({
               name: `[DesiDub] VMoly ${em.lang}`,
-              title: `${chosen.title} — E${episode}\nVMoly · ${em.lang} · HLS multi-audio (hi/ta/te/en)\nAudio + quality switch in player`,
-              url: wrapped,
+              title: `${chosen.title} — E${episode}\nVMoly · ${em.lang} · HLS multi-audio (hi/ta/te/en)`,
+              url: u,
               behaviorHints: { notWebReady: false },
               _ok: true,
             });
@@ -676,6 +721,8 @@ const server = http.createServer(async (req, res) => {
     if (u.pathname === '/') {
       return send(res, 200, `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DesiDubAnime</title></head><body style="font-family:system-ui;background:#0b0e14;color:#e8eaf0;max-width:640px;margin:40px auto;padding:0 18px"><h1 style="font-size:28px">Desi<span style="color:#ff6b35">Dub</span>Anime <span style="color:#8d96a5;font-size:14px">v${VERSION}</span></h1><p style="color:#9aa3b2;line-height:1.6">Hindi/Tamil/Telugu/Bengali dubbed anime. Multi-server with Abyss resolved (AES-CTR + /info), Mirror &amp; VMoly. Streams play direct from CDN.</p><a href="stremio://${u.host}/manifest.json" style="display:inline-block;margin-top:16px;padding:14px 34px;border-radius:12px;background:linear-gradient(90deg,#e65100,#ff6b35);color:#fff;font-weight:700;text-decoration:none">Install in Stremio</a></body></html>`, 'text/html; charset=utf-8');
     }
+    const ar = u.pathname.match(/^\/ar\/(\d+)\/(\d+)\/(\d+)\/([a-z0-9.-]+\.[a-z]{2,})$/i);
+    if (ar) return handleAbyssProxy(req, res, ar);
     const hz = u.pathname.match(/^\/hz\/([A-Za-z0-9_-]+?)(?:\.m3u8)?$/);
     if (hz) {
       try { return await handleRemanifest(Buffer.from(hz[1], 'base64url').toString('utf8'), res); }
