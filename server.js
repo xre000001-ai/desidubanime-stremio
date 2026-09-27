@@ -15,7 +15,7 @@ import fs from 'node:fs';
 import { fetch as undiciFetch, Agent } from 'undici';
 import { poolStart, poolStats, apiFetch } from './mb-lib/pool.js';
 
-const VERSION = '1.2.1';
+const VERSION = '1.3.0';
 const BASE = 'https://www.desidubanime.me';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const CINEMETA = 'https://v3-cinemeta.strem.io';
@@ -873,7 +873,7 @@ async function resolveEpisode(aliases, episode, season, year) {
               episode,
               season,
               year,
-              quality: 'HLS',
+              quality: 'FHD 1080p',
               note: '◇ multi-audio हि/த/తె/EN/JA · native seek',
               url: `${PUBLIC_BASE}/vm/${vmB64(u)}.m3u8`,
               q: -1, // HLS card sorts AFTER all resolution cards
@@ -971,9 +971,14 @@ const server = http.createServer(async (req, res) => {
     }
     const sm = u.pathname.match(/^\/stream\/(movie|series)\/([^/]+?)(?:\/(\d+)\/(\d+))?(?:\.json)?$/);
     if (sm) {
-      const imdb = decodeURIComponent(sm[2]).split(':')[0];
-      const season = Number(sm[3]) || 1;
-      const episode = Number(sm[4]) || 1;
+      // Stremio sends BOTH forms: /stream/series/tt/1/5.json AND /stream/series/tt:1:5.json
+      // (colon form often URL-encoded %3A). The colon form MUST parse, or every
+      // episode request resolves to S1E1 — the "same card on every episode" bug.
+      const rawId = decodeURIComponent(sm[2]);
+      const colon = rawId.match(/^(tt\d+):(\d+):(\d+)$/);
+      const imdb = colon ? colon[1] : rawId.split(':')[0];
+      const season = colon ? Number(colon[2]) : (sm[3] !== undefined ? Number(sm[3]) : 1);
+      const episode = colon ? Number(colon[3]) : (sm[4] !== undefined ? Number(sm[4]) : 1);
       const ck = `${sm[1]}:${imdb}:${season}:${episode}`;
       const cached = cacheGet(ck);
       if (cached) return send(res, 200, { streams: cached });
