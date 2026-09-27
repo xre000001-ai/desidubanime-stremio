@@ -225,26 +225,50 @@ async function findAnime(aliases, season) {
 async function animeEpisodes(slug) {
   const ck = `eps:${slug}`;
   const e = cache.get(ck);
-  if (e && e.v && Date.now() - e.at < (e.v.watch?.size ? 3600e3 : 3 * 60e3)) return e.v;
+  if (e && e.v && Date.now() - e.at < (e.v.watch?.size ? 6 * 3600e3 : 3 * 60e3)) return e.v;
   const html = await fetchText(`${BASE}/anime/${slug}/`, { timeout: 13000 });
-  const v = { watch: new Map(), total: 0 };   // ep -> watch url
-  if (html) {
+  const v = { watch: new Map(), total: 0 };   // ep number -> FULL watch url
+  // FULL episode list lives behind Kiranime's AJAX (the page HTML only links
+  // the latest tail). postID is embedded in the page.
+  const pid = (html && html.match(/postID["':=]+\s*(\d+)/) || [])[1];
+  let complete = false;
+  if (pid) {
+    let page = 1, maxp = 1;
+    do {
+      if (page > 1) await new Promise(r => setTimeout(r, 450)); // admin-ajax throttles bursts
+      const raw = await fetchText(`${BASE}/wp-admin/admin-ajax.php?action=get_episodes&anime_id=${pid}&page=${page}&order=asc`, { timeout: 12000 }).catch(() => null);
+      if (!raw || !raw.trimStart().startsWith('{')) break;
+      let data = null;
+      try { data = JSON.parse(raw).data; } catch { break; }
+      for (const ep of (data?.episodes || [])) {
+        const n = parseInt(ep.meta_number, 10);
+        if (Number.isFinite(n) && n >= 0 && ep.url) v.watch.set(n, ep.url);
+      }
+      maxp = Number(data?.max_episodes_page) || 1;
+      complete = page >= maxp;
+      page++;
+    } while (page <= Math.min(maxp, 8));
+  }
+  // fallback: watch links present in the page HTML (latest tail)
+  if (!v.watch.size && html) {
     const re = /href="https:\/\/www\.desidubanime\.me\/watch\/([^"]+?)-episode-(\d+)\/"/g;
     let m;
-    while ((m = re.exec(html))) v.watch.set(Number(m[2]), m[1]);
-    v.total = v.watch.size;
+    while ((m = re.exec(html))) v.watch.set(Number(m[2]), `${BASE}/watch/${m[1]}-episode-${m[2]}/`);
   }
-  cachePut(ck, { v, at: Date.now() }, 3600e3);
-  DBG('episodes', slug, '->', v.total);
+  v.total = v.watch.size;
+  // full list cached long; a partial list (throttled pages) re-fetches soon
+  cachePut(ck, { v, at: Date.now() }, complete ? 6 * 3600e3 : 10 * 60e3);
+  DBG('episodes', slug, '->', v.total, v.watch.size ? `range ${Math.min(...v.watch.keys())}-${Math.max(...v.watch.keys())}` : '', complete ? 'full' : 'partial');
   return v;
 }
 
 // ─── watch page: embed servers ───────────────────────────────────────────────
-async function watchEmbeds(watchSlug, ep) {
-  const ck = `w:${watchSlug}:${ep}`;
+async function watchEmbeds(watchUrl, ep) {
+  const ck = `w:${watchUrl}`;
   const e = cache.get(ck);
   if (e && Date.now() - e.at < 30 * 60e3) return e.v;
-  const html = await fetchText(`${BASE}/watch/${watchSlug}-episode-${ep}/`, { timeout: 13000 });
+  let html = await fetchText(watchUrl, { timeout: 13000 });
+  if (!html) { await new Promise(r => setTimeout(r, 1200)); html = await fetchText(watchUrl, { timeout: 13000 }).catch(() => ''); }
   const embeds = [];
   if (html) {
     const re = /data-embed-id="([^"]+)"/g;
@@ -261,8 +285,28 @@ async function watchEmbeds(watchSlug, ep) {
       } catch { /* skip */ }
     }
   }
-  cachePut(ck, { v: embeds, at: Date.now() }, 30 * 60e3);
-  DBG('embeds', watchSlug, ep, '->', embeds.map(x => x.server).join(','));
+  // an empty result may be a transient CF challenge — retry once, cache briefly
+  if (!embeds.length && html) {
+    await new Promise(r => setTimeout(r, 1200));
+    const html2 = await fetchText(watchUrl, { timeout: 13000 }).catch(() => '');
+    if (html2) {
+      const re2 = /data-embed-id="([^"]+)"/g;
+      let m2;
+      while ((m2 = re2.exec(html2))) {
+        const [srvB, urlB] = m2[1].split(':');
+        try {
+          const server = Buffer.from(srvB, 'base64').toString('utf8').trim();
+          const url = Buffer.from(urlB, 'base64').toString('utf8').trim();
+          if (/^https?:\/\//.test(url)) {
+            const lang = /(dub|Dub)$/i.test(server) ? 'DUB' : /(sub|Sub)$/i.test(server) ? 'SUB' : 'DUB';
+            embeds.push({ server: server.replace(/(dub|sub)$/i, '').trim() || server, url, lang });
+          }
+        } catch { /* skip */ }
+      }
+    }
+  }
+  cachePut(ck, { v: embeds, at: Date.now() }, embeds.length ? 30 * 60e3 : 60e3);
+  DBG('embeds', String(watchUrl).slice(-42), '->', embeds.map(x => x.server).join(','));
   return embeds;
 }
 
@@ -786,28 +830,14 @@ async function resolveEpisode(aliases, episode, season, year) {
   if (!best) return { streams: [], note: 'not found on DesiDubAnime' };
   const chosen = item || best;
   const eps = await animeEpisodes(chosen.slug);
-  // sequel entries often continue GLOBAL numbering: S2E1 = ep13, S3E1 = ep25…
-  // find the watch page whose global episode actually has embeds
-  let watchSlug = null, globalEp = episode;
-  const cands = [episode];
-  for (const off of [12, 13, 24, 25, 36, 37, 48, 49]) cands.push(episode + off, episode - off);
-  if (eps.watch.size) {
-    for (const ge of cands) {
-      if (ge < 1) continue;
-      const ws = eps.watch.get(ge);
-      if (!ws) continue;
-      const em = await watchEmbeds(ws, ge);
-      if (em.length) { watchSlug = ws; globalEp = ge; break; }
-    }
-    if (!watchSlug) {
-      const first = [...eps.watch.values()][0].replace(/-episode-\d+$/, '');
-      const em = await watchEmbeds(first, [...eps.watch.keys()][0]);
-      if (em.length) { watchSlug = first; globalEp = [...eps.watch.keys()][0]; }
-    }
-  }
-  if (!watchSlug) return { streams: [], note: 'no episodes listed' };
-  const embeds = await watchEmbeds(watchSlug, globalEp);
-  if (!embeds.length) return { streams: [], note: 'no embeds' };
+  // EPISODE EXACTNESS: the AJAX list is per-season numbered, so the requested
+  // episode number IS the list key — exact match or honest empty. We never
+  // substitute another episode.
+  const watchUrl = eps.watch.get(episode);
+  if (!watchUrl) return { streams: [], note: `episode ${episode} not listed` };
+  const embeds = await watchEmbeds(watchUrl, episode);
+  if (!embeds.length) return { streams: [], note: `no embeds for E${episode}` };
+  DBG('epmatch', `${chosen.slug} E${episode} exact`);
 
   const jobs = [];
   const streams = [];
@@ -832,7 +862,7 @@ async function resolveEpisode(aliases, episode, season, year) {
               quality: 'HLS',
               note: '◇ multi-audio हि/த/తె/EN/JA · native seek',
               url: `${PUBLIC_BASE}/vm/${vmB64(u)}.m3u8`,
-              q: 540,
+              q: -1, // HLS card sorts AFTER all resolution cards
             }));
           }
         }
