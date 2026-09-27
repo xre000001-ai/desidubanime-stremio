@@ -15,7 +15,7 @@ import fs from 'node:fs';
 import { fetch as undiciFetch, Agent } from 'undici';
 import { poolStart, poolStats, apiFetch } from './mb-lib/pool.js';
 
-const VERSION = '2.5.0';
+const VERSION = '2.5.1';
 const BASE = 'https://www.desidubanime.me';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const CINEMETA = 'https://v3-cinemeta.strem.io';
@@ -392,6 +392,42 @@ async function handleAbyssProxy(req, res, m) {
     if (rm) { A = Number(rm[1]); if (rm[2]) B = Number(rm[2]); }
   }
   if (A >= size) { res.writeHead(416, { 'content-range': `bytes */${size}`, 'access-control-allow-origin': '*' }); return res.end(); }
+  // NO Range visible (reverse proxy strips it): full-file stream from byte 0 —
+  // sequential playback always works; players disable seek (honest degradation).
+  if (!range && req.method === 'GET') {
+    const tok0 = abyssToken(md5, resId, size, size, 0);
+    const up0 = `https://${host}/sora/${size}/${tok0}`;
+    res.on('close', () => { try { c0.kill('SIGKILL'); } catch { /* noop */ } });
+    let c0, h0done = false, b0 = Buffer.alloc(0);
+    try { c0 = spawn('curl', ['-s', '-N', '-i', '-L', '-A', UA, '-H', `Referer: ${ABYSS_REFERER}`, up0]); } catch { return send(res, 502, ''); }
+    c0.stdout.on('data', d => {
+      if (!h0done) {
+        b0 = Buffer.concat([b0, d]);
+        for (;;) {
+          const i = b0.indexOf('\r\n\r\n');
+          if (i < 0) return;
+          const st = parseInt((b0.slice(0, i).toString('latin1').match(/HTTP\/\S+ (\d{3})/) || [])[1] || 0, 10);
+          b0 = b0.slice(i + 4);
+          if (st >= 300 && st < 400) continue;
+          h0done = true;
+          if (st !== 200 && st !== 206) { if (!res.headersSent) res.writeHead(502, { 'access-control-allow-origin': '*' }); try { c0.kill('SIGKILL'); } catch { /* noop */ } return res.end(); }
+          res.writeHead(200, {
+            'content-type': 'video/mp4',
+            'cache-control': 'no-store',
+            'access-control-allow-origin': '*',
+            'access-control-expose-headers': 'content-length, accept-ranges',
+          });
+          break;
+        }
+        if (!h0done) return;
+        d = b0;
+      }
+      if (d.length) res.write(d);
+    });
+    c0.stdout.on('end', () => { if (!h0done) { if (!res.headersSent) res.writeHead(502, { 'access-control-allow-origin': '*' }); return res.end(); } res.end(); });
+    c0.on('error', () => { if (!res.headersSent) { try { res.writeHead(502); } catch { /* noop */ } } res.end(); });
+    return;
+  }
   if (req.method === 'HEAD') {
     res.writeHead(200, {
       'content-type': 'video/mp4',
@@ -798,6 +834,15 @@ const server = http.createServer(async (req, res) => {
     }
     if (u.pathname === '/') {
       return send(res, 200, `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DesiDubAnime</title></head><body style="font-family:system-ui;background:#0b0e14;color:#e8eaf0;max-width:640px;margin:40px auto;padding:0 18px"><h1 style="font-size:28px">Desi<span style="color:#ff6b35">Dub</span>Anime <span style="color:#8d96a5;font-size:14px">v${VERSION}</span></h1><p style="color:#9aa3b2;line-height:1.6">Hindi/Tamil/Telugu/Bengali dubbed anime. Multi-server with Abyss resolved (AES-CTR + /info), Mirror &amp; VMoly. Streams play direct from CDN.</p><a href="stremio://${u.host}/manifest.json" style="display:inline-block;margin-top:16px;padding:14px 34px;border-radius:12px;background:linear-gradient(90deg,#e65100,#ff6b35);color:#fff;font-weight:700;text-decoration:none">Install in Stremio</a></body></html>`, 'text/html; charset=utf-8');
+    }
+    if (u.pathname === '/hdr') {
+      return send(res, 200, {
+        method: req.method,
+        range: req.headers.range || null,
+        ua: (req.headers['user-agent'] || '').slice(0, 50),
+        http: req.httpVersion,
+        path: u.pathname,
+      });
     }
     const vm = u.pathname.match(/^\/vm\/([A-Za-z0-9_-]+?)(?:\.(?:m3u8|ts))?$/);
     if (vm) return handleVmProxy(res, Buffer.from(vm[1], 'base64url').toString('utf8'), u.pathname.endsWith('.m3u8'));
