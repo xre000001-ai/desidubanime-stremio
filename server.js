@@ -15,7 +15,7 @@ import fs from 'node:fs';
 import { fetch as undiciFetch, Agent } from 'undici';
 import { poolStart, poolStats, apiFetch } from './mb-lib/pool.js';
 
-const VERSION = '2.4.1';
+const VERSION = '2.4.2';
 const BASE = 'https://www.desidubanime.me';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const CINEMETA = 'https://v3-cinemeta.strem.io';
@@ -348,7 +348,7 @@ async function handleAbyssProxy(req, res, m) {
       }
       headerDone = true;
       res.writeHead(st, {
-        'content-type': hh['content-type'] || 'video/mp4',
+        'content-type': 'video/mp4',
         ...(hh['content-length'] ? { 'content-length': hh['content-length'] } : {}),
         ...(hh['content-range'] ? { 'content-range': hh['content-range'] } : {}),
         'accept-ranges': hh['accept-ranges'] || 'bytes',
